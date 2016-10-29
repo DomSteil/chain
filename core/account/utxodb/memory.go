@@ -152,6 +152,7 @@ func (mr *MemoryReserver) findMatchingUTXOs(ctx context.Context, source Source) 
 		SELECT tx_hash, index, amount, control_program_index, control_program, confirmed_in
 		FROM account_utxos a
 		WHERE account_id = $1 AND asset_id = $2
+		ORDER BY amount ASC
 	`
 	var utxos []*UTXO
 	err := pg.ForQueryRows(ctx, mr.db, q, source.AccountID, source.AssetID,
