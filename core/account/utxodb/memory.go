@@ -16,15 +16,9 @@ import (
 func NewMemoryReserver(db pg.DB) *MemoryReserver {
 	return &MemoryReserver{
 		db:           db,
-		reservations: make(map[int32]reservation),
+		reservations: make(map[int32]*Reservation),
 		accounts:     make(map[string]*accountReserver),
 	}
-}
-
-type reservation struct {
-	accountID string
-	utxos     []*UTXO
-	expiry    time.Time
 }
 
 // MemoryReserver implements a UTXO reserver that stores reservations
@@ -39,68 +33,71 @@ type MemoryReserver struct {
 	nextReservationID int32
 
 	reservationsMu sync.Mutex
-	reservations   map[int32]reservation
+	reservations   map[int32]*Reservation
 
 	accountsMu sync.Mutex
 	accounts   map[string]*accountReserver
 }
 
-func (mr *MemoryReserver) Reserve(ctx context.Context, source Source, exp time.Time) (reservationID int32, u []*UTXO, c []Change, err error) {
+func (mr *MemoryReserver) Reserve(ctx context.Context, source Source, exp time.Time) (res *Reservation, err error) {
 	// Find the set of UTXOs that match this source.
 	utxos, err := mr.findMatchingUTXOs(ctx, source)
 	if err != nil {
-		return 0, nil, nil, err
+		return nil, err
 	}
 
 	// Try to reserve the right amount.
 	rid := atomic.AddInt32(&mr.nextReservationID, 1)
 	reserved, total, err := mr.account(source.AccountID).reserve(rid, source, utxos)
 	if err != nil {
-		return 0, nil, nil, err
+		return nil, err
+	}
+
+	res = &Reservation{
+		ID:        rid,
+		AccountID: source.AccountID,
+		UTXOs:     reserved,
+		Expiry:    exp,
 	}
 
 	// Save the successful reservation.
 	mr.reservationsMu.Lock()
 	defer mr.reservationsMu.Unlock()
-
-	res := reservation{
-		accountID: source.AccountID,
-		utxos:     reserved,
-		expiry:    exp,
-	}
 	mr.reservations[rid] = res
 
 	// Make change if necessary
 	if total > source.Amount {
-		c = append(c, Change{
+		res.Change = append(res.Change, Change{
 			Source: source,
 			Amount: total - source.Amount,
 		})
 	}
-	return rid, reserved, c, nil
+	return res, nil
 }
 
-func (mr *MemoryReserver) ReserveUTXO(ctx context.Context, txHash bc.Hash, pos uint32, clientToken *string, exp time.Time) (int32, *UTXO, error) {
+func (mr *MemoryReserver) ReserveUTXO(ctx context.Context, txHash bc.Hash, pos uint32, clientToken *string, exp time.Time) (*Reservation, error) {
 	utxo, err := mr.findSpecificUTXO(ctx, txHash, pos)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 
 	rid := atomic.AddInt32(&mr.nextReservationID, 1)
 	err = mr.account(utxo.AccountID).reserveUTXO(rid, utxo)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 
-	mr.reservationsMu.Lock()
-	mr.reservations[rid] = reservation{
-		accountID: utxo.AccountID,
-		utxos:     []*UTXO{utxo},
-		expiry:    exp,
+	res := &Reservation{
+		ID:        rid,
+		AccountID: utxo.AccountID,
+		UTXOs:     []*UTXO{utxo},
+		Expiry:    exp,
 	}
+	mr.reservationsMu.Lock()
+	mr.reservations[rid] = res
 	mr.reservationsMu.Unlock()
 
-	return rid, utxo, nil
+	return res, nil
 }
 
 // Cancel makes a best-effort attempt at canceling the reservation with
@@ -113,17 +110,17 @@ func (mr *MemoryReserver) Cancel(ctx context.Context, rid int32) error {
 	if !ok {
 		return fmt.Errorf("couldn't find reservation %d", rid)
 	}
-	mr.account(res.accountID).cancel(res)
+	mr.account(res.AccountID).cancel(res)
 	return nil
 }
 
 func (mr *MemoryReserver) ExpireReservations(ctx context.Context) error {
 	// Remove records of any reservations that have expired.
 	now := time.Now()
-	var canceled []reservation
+	var canceled []*Reservation
 	mr.reservationsMu.Lock()
 	for rid, res := range mr.reservations {
-		if res.expiry.Before(now) {
+		if res.Expiry.Before(now) {
 			canceled = append(canceled, res)
 			delete(mr.reservations, rid)
 		}
@@ -133,7 +130,7 @@ func (mr *MemoryReserver) ExpireReservations(ctx context.Context) error {
 	// If we removed any expired reservations, update the corresponding
 	// acount reservers.
 	for _, res := range canceled {
-		mr.account(res.accountID).cancel(res)
+		mr.account(res.AccountID).cancel(res)
 	}
 
 	// Cleanup any account reservers that don't have anything reserved.
@@ -267,10 +264,10 @@ func (ar *accountReserver) reserveUTXO(rid int32, utxo *UTXO) error {
 	return nil
 }
 
-func (ar *accountReserver) cancel(res reservation) {
+func (ar *accountReserver) cancel(res *Reservation) {
 	ar.mu.Lock()
 	defer ar.mu.Unlock()
-	for _, utxo := range res.utxos {
+	for _, utxo := range res.UTXOs {
 		delete(ar.reserved, utxo.Outpoint)
 	}
 }
